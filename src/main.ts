@@ -276,7 +276,12 @@ const cornerIndexFromEdge = [
   [3, 7],
 ];
 
-function interpolateVertex(p1, p2, val1, val2, surfaceLevel) {
+interface GridPoint {
+  value: number;
+  position: THREE.Vector3;
+}
+
+function interpolateVertex(p1: THREE.Vector3, p2: THREE.Vector3, val1: number, val2: number, surfaceLevel: number): THREE.Vector3 {
   const denom = val2 - val1;
   if (Math.abs(denom) < 1e-6) {
     return new THREE.Vector3().lerpVectors(p1, p2, 0.5);
@@ -297,8 +302,6 @@ camera.position.set(5, 5, 10);
 controls.update();
 controls.autoRotate = true;
 
-const geometry = new THREE.SphereGeometry(0.05, 32, 32);
-
 const noise = new SimplexNoise();
 const surfaceLevel = 0.6;
 
@@ -307,7 +310,7 @@ const sizeX = 20;
 const sizeY = 5;
 const sizeZ = 20;
 
-const points = [];
+const points: GridPoint[][][] = [];
 for (let x = 0; x < sizeX; x++) {
   points[x] = [];
   for (let y = 0; y < sizeY; y++) {
@@ -394,7 +397,7 @@ for (let i = 0; i < cubes.length; i++) {
 }
 
 
-function animate(time) {
+function animate() {
   controls.update();
   renderer.render(scene, camera);
 }
