@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SimplexNoise } from 'three/addons/math/SimplexNoise.js';
+import { BufferGeometryUtils } from 'three/examples/jsm/Addons.js';
 
 const TriangulationTable = [
   [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1],
@@ -290,6 +291,52 @@ function interpolateVertex(p1: THREE.Vector3, p2: THREE.Vector3, val1: number, v
   return new THREE.Vector3().lerpVectors(p1, p2, t);
 }
 
+function fbm3(x: number, y: number, z: number, octaves = 5, lacunarity = 2.0, gain = 0.5): number {
+  let freq = 1, amp = 1, sum = 0, norm = 0;
+  for (let i = 0; i < octaves; i++) {
+    sum += amp * noise.noise3d(x * freq, y * freq, z * freq);
+    norm += amp;
+    freq *= lacunarity;
+    amp *= gain;
+  }
+  return sum / norm;
+}
+
+
+const biomes = [
+  { sand: 0x659988, grass: 0x4d7568, rock: 0x667db4, snow: 0x6ebdea }, // Emerald
+  { sand: 0xdd8d9f, grass: 0xb63f83, rock: 0x47195d, snow: 0xdd8d9f }, // Amythest
+  { sand: 0x667db4, grass: 0x5b5f90, rock: 0x667db4, snow: 0x6ebdea }, // Diamond
+];
+const islandBiome = (id: number) => biomes[id % biomes.length];
+
+function gradient(y: number, stops: { y: number; col: THREE.Color }[]): THREE.Color {
+  if (y <= stops[0].y) return stops[0].col.clone();
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (y <= stops[i + 1].y) {
+      const t = (y - stops[i].y) / (stops[i + 1].y - stops[i].y);
+      return stops[i].col.clone().lerp(stops[i + 1].col, t);
+    }
+  }
+  return stops[stops.length - 1].col.clone();
+}
+
+function topStops(b: typeof biomes[0]) {
+  return [
+    { y: 0.5, col: new THREE.Color(b.sand)  },
+    { y: 2.0, col: new THREE.Color(b.grass) },
+    { y: 6.0, col: new THREE.Color(b.rock)  },
+    { y: 9.0, col: new THREE.Color(b.snow)  },
+  ];
+}
+
+function stoneColor(y: number): THREE.Color {
+  const shallow = new THREE.Color(0x5b5f90);
+  const deep = new THREE.Color(0x544c70);
+  return shallow.lerp(deep, THREE.MathUtils.clamp(-y / (stretch * 10), 0, 1));
+}
+
+
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
 const renderer = new THREE.WebGLRenderer();
@@ -304,11 +351,19 @@ controls.autoRotate = true;
 
 const noise = new SimplexNoise();
 const surfaceLevel = 0.6;
+const frequency = 0.03;
+const stretch = 3.0;
 
+const resolution = 1.5;
+const inv = 1 / resolution;
 
-const sizeX = 20;
-const sizeY = 5;
-const sizeZ = 20;
+const worldX = 200;
+const worldY = 40;
+const worldZ = 200;
+
+const sizeX = Math.round(worldX * resolution);
+const sizeY = Math.round(worldY * resolution);
+const sizeZ = Math.round(worldZ * resolution);
 
 const points: GridPoint[][][] = [];
 for (let x = 0; x < sizeX; x++) {
@@ -316,19 +371,48 @@ for (let x = 0; x < sizeX; x++) {
   for (let y = 0; y < sizeY; y++) {
     points[x][y] = [];
     for (let z = 0; z < sizeZ; z++) {
-      const frequency = 0.1;
-      const n = noise.noise3d(x * frequency, y * frequency, z * frequency);
-      const normalized = (n + 1) / 2;
+      const wx = x * inv, wy = y * inv, wz = z * inv;
+      const n = (fbm3(wx * frequency, wy * frequency, wz * frequency) + 1) / 2;
+      const heightFrac = wy / (worldY - 1);
+      const value = n - heightFrac;
 
-      points[x][y][z] = {
-        value: normalized,
-        position: new THREE.Vector3(x, y, z)
-      };
+      points[x][y][z] = { value, position: new THREE.Vector3(wx, wy, wz) };
     }
   }
 }
-const cubes = [];
 
+const islandId: number[][][] = [];
+for (let x = 0; x < sizeX; x++) {
+  islandId[x] = [];
+  for (let y = 0; y < sizeY; y++) islandId[x][y] = new Array(sizeZ).fill(-1);
+}
+
+const solid = (x: number, y: number, z: number) => x >= 0 && y >= 0 && z >= 0 && x < sizeX && y < sizeY && z < sizeZ && points[x][y][z].value > surfaceLevel;
+
+const nb = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+let nextId = 0;
+for (let x = 0; x < sizeX; x++)
+  for (let y = 0; y < sizeY; y++)
+    for (let z = 0; z < sizeZ; z++) {
+      if (!solid(x, y, z) || islandId[x][y][z] !== -1) continue;
+      const id = nextId++;
+      const stack: number[][] = [[x, y, z]];
+      islandId[x][y][z] = id;
+      while (stack.length) {
+        const [cx, cy, cz] = stack.pop()!;
+        for (const [dx, dy, dz] of nb) {
+          const nx = cx+dx
+          const ny = cy+dy
+          const nz = cz+dz;
+          if (solid(nx, ny, nz) && islandId[nx][ny][nz] === -1) {
+            islandId[nx][ny][nz] = id;
+            stack.push([nx, ny, nz]);
+          }
+        }
+      }
+    }
+
+const cubes = [];
 for (let x = 0; x < points.length - 1; x++) {
   for (let y = 0; y < points[0].length - 1; y++) {
     for (let z = 0; z < points[0][0].length - 1; z++) {
@@ -351,50 +435,72 @@ for (let x = 0; x < points.length - 1; x++) {
   }
 }
 
+const allVerts: number[] = [];
+const allColors: number[] = [];
 
 for (let i = 0; i < cubes.length; i++) {
   let cubeIndex = 0;
-  for (let j = 0; j < 8; j++) {
-    if (cubes[i].corners[j].value > surfaceLevel) {
-      cubeIndex |= 1 << j;
-    }
-  }
+  for (let j = 0; j < 8; j++)
+    if (cubes[i].corners[j].value > surfaceLevel) cubeIndex |= 1 << j;
 
   const triangulation = TriangulationTable[cubeIndex];
-  const vertices = [];
-
-  for (let t = 0; t < triangulation.length && triangulation[t] !== -1; t++) {
-    const edgeIndex = triangulation[t];
-    const [index1, index2] = cornerIndexFromEdge[edgeIndex];
-
-    const c1 = cubes[i].corners[index1];
-    const c2 = cubes[i].corners[index2];
-    const vertexPos = interpolateVertex(c1.position, c2.position, c1.value, c2.value, surfaceLevel);
-
-
-    vertices.push(vertexPos);
+  for (let t = 0; t < triangulation.length && triangulation[t] !== -1; t += 3) {
+    const P: THREE.Vector3[] = [];
+    const C: THREE.Color[] = [];
+    for (let k = 0; k < 3; k++) {
+      const [a, b] = cornerIndexFromEdge[triangulation[t + k]];
+      const c1 = cubes[i].corners[a], c2 = cubes[i].corners[b];
+      const pos = interpolateVertex(c1.position, c2.position, c1.value, c2.value, surfaceLevel);
+      const sc = c1.value > surfaceLevel ? c1 : c2;
+      const gx = Math.round(sc.position.x * resolution);
+      const gy = Math.round(sc.position.y * resolution);
+      const gz = Math.round(sc.position.z * resolution);
+      const id = islandId[gx][gy][gz];
+      P.push(pos);
+      C.push(gradient(pos.y, topStops(islandBiome(id))));
+    }
+    for (const o of [2, 1, 0]) {
+      allVerts.push(P[o].x, P[o].y, P[o].z);
+      allColors.push(C[o].r, C[o].g, C[o].b);
+    }
   }
-
-  const flat = new Float32Array(vertices.length * 3);
-
-  for (let v = 0; v < vertices.length; v++) {
-    flat[v * 3 + 0] = vertices[v].x;
-    flat[v * 3 + 1] = vertices[v].y;
-    flat[v * 3 + 2] = vertices[v].z;
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(flat, 3));
-
-  const material = new THREE.MeshBasicMaterial({
-    color: new THREE.Color().setHSL(Math.random(), 0.5, 0.5),
-    side: THREE.DoubleSide
-  });
-
-  const triangle = new THREE.Mesh(geometry, material);
-  scene.add(triangle);
-
 }
+
+const geometry = new THREE.BufferGeometry();
+geometry.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
+geometry.computeVertexNormals();
+
+scene.add(new THREE.HemisphereLight(0xddeeff, 0x4a5d23, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(10, 20, 10);
+scene.add(sun);
+
+const topGeo = new THREE.BufferGeometry();
+topGeo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
+topGeo.setAttribute('color',    new THREE.Float32BufferAttribute(allColors, 3));
+
+const bottomGeo = topGeo.clone();
+bottomGeo.scale(1, -stretch, 1);
+const pos = bottomGeo.getAttribute('position').array as Float32Array;
+
+for (let i = 0; i < pos.length; i += 9) {
+  for (let k = 0; k < 3; k++) {
+    const tmp = pos[i + k]; pos[i + k] = pos[i + 6 + k]; pos[i + 6 + k] = tmp;
+  }
+}
+
+const bcol = bottomGeo.getAttribute('color').array as Float32Array;
+for (let i = 0; i < pos.length; i += 3) {
+  const c = stoneColor(pos[i + 1]);
+  bcol[i] = c.r; bcol[i + 1] = c.g; bcol[i + 2] = c.b;
+}
+
+let merged = BufferGeometryUtils.mergeGeometries([topGeo, bottomGeo]);
+merged = BufferGeometryUtils.mergeVertices(merged);
+merged.computeVertexNormals();
+
+const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true });
+scene.add(new THREE.Mesh(merged, mat));
 
 
 function animate() {
