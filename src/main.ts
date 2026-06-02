@@ -263,33 +263,15 @@ const TriangulationTable = [
 ];
 
 const cornerIndexFromEdge = [
-  [0, 1],
-  [1, 2],
-  [2, 3],
-  [3, 0],
-  [4, 5],
-  [5, 6],
-  [6, 7],
-  [7, 4],
-  [0, 4],
-  [1, 5],
-  [2, 6],
-  [3, 7],
+  [0, 1], [1, 2], [2, 3], [3, 0],
+  [4, 5], [5, 6], [6, 7], [7, 4],
+  [0, 4], [1, 5], [2, 6], [3, 7],
 ];
 
-interface GridPoint {
-  value: number;
-  position: THREE.Vector3;
-}
-
-function interpolateVertex(p1: THREE.Vector3, p2: THREE.Vector3, val1: number, val2: number, surfaceLevel: number): THREE.Vector3 {
-  const denom = val2 - val1;
-  if (Math.abs(denom) < 1e-6) {
-    return new THREE.Vector3().lerpVectors(p1, p2, 0.5);
-  }
-  const t = (surfaceLevel - val1) / denom;
-  return new THREE.Vector3().lerpVectors(p1, p2, t);
-}
+const cornerOffset = [
+  [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+  [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+];
 
 function fbm3(x: number, y: number, z: number, octaves = 5, lacunarity = 2.0, gain = 0.5): number {
   let freq = 1, amp = 1, sum = 0, norm = 0;
@@ -302,38 +284,203 @@ function fbm3(x: number, y: number, z: number, octaves = 5, lacunarity = 2.0, ga
   return sum / norm;
 }
 
-
 const biomes = [
   { sand: 0x659988, grass: 0x4d7568, rock: 0x667db4, snow: 0x6ebdea }, // Emerald
   { sand: 0xdd8d9f, grass: 0xb63f83, rock: 0x47195d, snow: 0xdd8d9f }, // Amythest
   { sand: 0x667db4, grass: 0x5b5f90, rock: 0x667db4, snow: 0x6ebdea }, // Diamond
 ];
-const islandBiome = (id: number) => biomes[id % biomes.length];
 
-function gradient(y: number, stops: { y: number; col: THREE.Color }[]): THREE.Color {
-  if (y <= stops[0].y) return stops[0].col.clone();
+interface Stop { y: number; r: number; g: number; b: number; }
+function makeStops(b: typeof biomes[0]): Stop[] {
+  const c = (hex: number) => { const col = new THREE.Color(hex); return { r: col.r, g: col.g, b: col.b }; };
+  const sand = c(b.sand), grass = c(b.grass), rock = c(b.rock), snow = c(b.snow);
+  return [
+    { y: 0.5, ...sand },
+    { y: 2.0, ...grass },
+    { y: 6.0, ...rock },
+    { y: 9.0, ...snow },
+  ];
+}
+const biomeStops: Stop[][] = biomes.map(makeStops);
+
+function gradientRGB(y: number, stops: Stop[], out: Float32Array): void {
+  if (y <= stops[0].y) { out[0] = stops[0].r; out[1] = stops[0].g; out[2] = stops[0].b; return; }
   for (let i = 0; i < stops.length - 1; i++) {
-    if (y <= stops[i + 1].y) {
-      const t = (y - stops[i].y) / (stops[i + 1].y - stops[i].y);
-      return stops[i].col.clone().lerp(stops[i + 1].col, t);
+    const s0 = stops[i], s1 = stops[i + 1];
+    if (y <= s1.y) {
+      const t = (y - s0.y) / (s1.y - s0.y);
+      out[0] = s0.r + (s1.r - s0.r) * t;
+      out[1] = s0.g + (s1.g - s0.g) * t;
+      out[2] = s0.b + (s1.b - s0.b) * t;
+      return;
     }
   }
-  return stops[stops.length - 1].col.clone();
-}
-
-function topStops(b: typeof biomes[0]) {
-  return [
-    { y: 0.5, col: new THREE.Color(b.sand)  },
-    { y: 2.0, col: new THREE.Color(b.grass) },
-    { y: 6.0, col: new THREE.Color(b.rock)  },
-    { y: 9.0, col: new THREE.Color(b.snow)  },
-  ];
+  const last = stops[stops.length - 1];
+  out[0] = last.r; out[1] = last.g; out[2] = last.b;
 }
 
 function stoneColor(y: number): THREE.Color {
   const shallow = new THREE.Color(0x5b5f90);
   const deep = new THREE.Color(0x544c70);
   return shallow.lerp(deep, THREE.MathUtils.clamp(-y / (stretch * 10), 0, 1));
+}
+
+const STONE_SHALLOW = new THREE.Color(0x5b5f90);
+const STONE_DEEP = new THREE.Color(0x544c70);
+function stoneColorRGB(y: number, out: Float32Array): void {
+  const t = THREE.MathUtils.clamp(-y / (stretch * 10), 0, 1);
+  out[0] = STONE_SHALLOW.r + (STONE_DEEP.r - STONE_SHALLOW.r) * t;
+  out[1] = STONE_SHALLOW.g + (STONE_DEEP.g - STONE_SHALLOW.g) * t;
+  out[2] = STONE_SHALLOW.b + (STONE_DEEP.b - STONE_SHALLOW.b) * t;
+}
+
+const seamColorBand = 3.0; 
+const seamHeightAmp = 1.6;
+const seamHeightFreq = 0.08;
+const seamDeformBand = 2.5; 
+const seamDispXZ = 0.7; 
+const seamDispY = 0.5; 
+const seamDeformFreq = 0.16; 
+
+function smooth01(t: number): number {
+  const c = t < 0 ? 0 : t > 1 ? 1 : t;
+  return c * c * (3 - 2 * c);
+}
+
+function seamBlend(x: number, y: number, z: number): number {
+  const localSeam = seamHeightAmp * noise.noise3d(x * seamHeightFreq, 0, z * seamHeightFreq);
+  return smooth01((y - (localSeam - seamColorBand)) / (2 * seamColorBand));
+}
+
+function seamDeform(x: number, y: number, z: number, out: Float64Array): void {
+  const a = Math.abs(y);
+  if (a >= seamDeformBand) { out[0] = x; out[1] = y; out[2] = z; return; }
+  const w = smooth01(1 - a / seamDeformBand);
+  const nx = noise.noise3d(x * seamDeformFreq, 0.0, z * seamDeformFreq);
+  const ny = noise.noise3d(x * seamDeformFreq + 31.7, 12.3, z * seamDeformFreq - 8.1);
+  const nz = noise.noise3d(x * seamDeformFreq - 19.4, 27.6, z * seamDeformFreq + 5.2);
+  out[0] = x + nx * seamDispXZ * w;
+  out[1] = y + ny * seamDispY * w;
+  out[2] = z + nz * seamDispXZ * w;
+}
+
+const ROCKS_ENABLED = true;
+const rockBiomes = new Set<number>([0, 2]);
+const rockUpThreshold = 2;
+const maxRocks = 100;
+const rockMinRadius = 0.9;
+const rockMaxRadius = 1.8;
+const rockNoiseAmp = 0.45;
+const rockNoiseFreq = 0.9;
+const rockSquashY = 1.4;
+const rockBury = 0.3;
+
+function mulberry32(a: number) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const rockVerts: number[] = [];
+const rockColors: number[] = [];
+
+const ROCK_DARK = new THREE.Color(0x3e3b4a);
+const ROCK_LIGHT = new THREE.Color(0x8f8ca0);
+const rockTint = biomes.map(b => new THREE.Color(b.rock));
+
+function rockColorRGB(localT: number, tintR: number, tintG: number, tintB: number, out: Float32Array): void {
+  const t = localT < 0 ? 0 : localT > 1 ? 1 : localT;
+  const baseR = ROCK_DARK.r + (ROCK_LIGHT.r - ROCK_DARK.r) * t;
+  const baseG = ROCK_DARK.g + (ROCK_LIGHT.g - ROCK_DARK.g) * t;
+  const baseB = ROCK_DARK.b + (ROCK_LIGHT.b - ROCK_DARK.b) * t;
+  const k = 0.25;
+  out[0] = baseR + (tintR - baseR) * k;
+  out[1] = baseG + (tintG - baseG) * k;
+  out[2] = baseB + (tintB - baseB) * k;
+}
+
+const rval = new Float64Array(8);
+const rwx = new Float64Array(8);
+const rwy = new Float64Array(8);
+const rwz = new Float64Array(8);
+const rTriPos = new Float64Array(9);
+const rTriCol = new Float64Array(9);
+const rTmpCol = new Float32Array(3);
+
+function marchRock(cx: number, cy: number, cz: number, radius: number, sx: number, sy: number, sz: number, biomeIndex: number): void {
+  const maxSurface = radius * (1 + rockNoiseAmp);
+  const half = maxSurface + inv;
+  const x0 = cx - half, y0 = cy - half, z0 = cz - half;
+  const cells = Math.ceil((2 * half) / inv);
+  const np = cells + 1;
+
+  const dens = new Float64Array(np * np * np);
+  const di = (i: number, j: number, k: number) => (i * np + j) * np + k;
+  for (let i = 0; i < np; i++) {
+    const wx = x0 + i * inv, dx = wx - cx;
+    for (let j = 0; j < np; j++) {
+      const wy = y0 + j * inv, dy = (wy - cy) * rockSquashY;
+      for (let k = 0; k < np; k++) {
+        const wz = z0 + k * inv, dz = wz - cz;
+        const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const bump = fbm3(wx * rockNoiseFreq + sx, wy * rockNoiseFreq + sy, wz * rockNoiseFreq + sz);
+        const surface = radius * (1 + rockNoiseAmp * bump);
+        dens[di(i, j, k)] = surface - r;
+      }
+    }
+  }
+
+  const yMin = y0, yRange = 2 * half;
+  const tintR = rockTint[biomeIndex % rockTint.length].r;
+  const tintG = rockTint[biomeIndex % rockTint.length].g;
+  const tintB = rockTint[biomeIndex % rockTint.length].b;
+
+  for (let ci = 0; ci < cells; ci++) {
+    for (let cj = 0; cj < cells; cj++) {
+      for (let ck = 0; ck < cells; ck++) {
+        let cubeIndex = 0;
+        for (let c = 0; c < 8; c++) {
+          const o = cornerOffset[c];
+          const v = dens[di(ci + o[0], cj + o[1], ck + o[2])];
+          rval[c] = v;
+          rwx[c] = x0 + (ci + o[0]) * inv;
+          rwy[c] = y0 + (cj + o[1]) * inv;
+          rwz[c] = z0 + (ck + o[2]) * inv;
+          if (v > 0) cubeIndex |= 1 << c;
+        }
+        if (cubeIndex === 0 || cubeIndex === 255) continue;
+
+        const tri = TriangulationTable[cubeIndex];
+        for (let t = 0; t < tri.length && tri[t] !== -1; t += 3) {
+          for (let k = 0; k < 3; k++) {
+            const e = tri[t + k];
+            const a = cornerIndexFromEdge[e][0], b = cornerIndexFromEdge[e][1];
+            const va = rval[a], vb = rval[b];
+            const denom = vb - va;
+            const tt = Math.abs(denom) < 1e-6 ? 0.5 : (0 - va) / denom; // surface level 0
+
+            const px = rwx[a] + (rwx[b] - rwx[a]) * tt;
+            const py = rwy[a] + (rwy[b] - rwy[a]) * tt;
+            const pz = rwz[a] + (rwz[b] - rwz[a]) * tt;
+
+            rockColorRGB((py - yMin) / yRange, tintR, tintG, tintB, rTmpCol);
+
+            const k3 = k * 3;
+            rTriPos[k3] = px; rTriPos[k3 + 1] = py; rTriPos[k3 + 2] = pz;
+            rTriCol[k3] = rTmpCol[0]; rTriCol[k3 + 1] = rTmpCol[1]; rTriCol[k3 + 2] = rTmpCol[2];
+          }
+          for (const ord of [2, 1, 0]) {
+            const o3 = ord * 3;
+            rockVerts.push(rTriPos[o3], rTriPos[o3 + 1], rTriPos[o3 + 2]);
+            rockColors.push(rTriCol[o3], rTriCol[o3 + 1], rTriCol[o3 + 2]);
+          }
+        }
+      }
+    }
+  }
 }
 
 
@@ -354,7 +501,7 @@ const surfaceLevel = 0.6;
 const frequency = 0.03;
 const stretch = 3.0;
 
-const resolution = 1.5;
+const resolution = 2;
 const inv = 1 / resolution;
 
 const worldX = 200;
@@ -365,142 +512,237 @@ const sizeX = Math.round(worldX * resolution);
 const sizeY = Math.round(worldY * resolution);
 const sizeZ = Math.round(worldZ * resolution);
 
-const points: GridPoint[][][] = [];
-for (let x = 0; x < sizeX; x++) {
-  points[x] = [];
-  for (let y = 0; y < sizeY; y++) {
-    points[x][y] = [];
-    for (let z = 0; z < sizeZ; z++) {
-      const wx = x * inv, wy = y * inv, wz = z * inv;
-      const n = (fbm3(wx * frequency, wy * frequency, wz * frequency) + 1) / 2;
-      const heightFrac = wy / (worldY - 1);
-      const value = n - heightFrac;
+const total = sizeX * sizeY * sizeZ;
+const idx = (x: number, y: number, z: number) => (x * sizeY + y) * sizeZ + z;
 
-      points[x][y][z] = { value, position: new THREE.Vector3(wx, wy, wz) };
+const values = new Float32Array(total);
+for (let x = 0; x < sizeX; x++) {
+  for (let y = 0; y < sizeY; y++) {
+    const wy = y * inv;
+    const heightFrac = wy / (worldY - 1);
+    for (let z = 0; z < sizeZ; z++) {
+      const n = (fbm3(x * inv * frequency, wy * frequency, z * inv * frequency) + 1) / 2;
+      values[idx(x, y, z)] = n - heightFrac;
     }
   }
 }
 
-const islandId: number[][][] = [];
-for (let x = 0; x < sizeX; x++) {
-  islandId[x] = [];
-  for (let y = 0; y < sizeY; y++) islandId[x][y] = new Array(sizeZ).fill(-1);
-}
-
-const solid = (x: number, y: number, z: number) => x >= 0 && y >= 0 && z >= 0 && x < sizeX && y < sizeY && z < sizeZ && points[x][y][z].value > surfaceLevel;
-
-const nb = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+const islandId = new Int32Array(total).fill(-1);
+const nb = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
 let nextId = 0;
+const stack: number[] = [];
 for (let x = 0; x < sizeX; x++)
   for (let y = 0; y < sizeY; y++)
     for (let z = 0; z < sizeZ; z++) {
-      if (!solid(x, y, z) || islandId[x][y][z] !== -1) continue;
+      const i0 = idx(x, y, z);
+      if (!(values[i0] > surfaceLevel) || islandId[i0] !== -1) continue;
       const id = nextId++;
-      const stack: number[][] = [[x, y, z]];
-      islandId[x][y][z] = id;
+      islandId[i0] = id;
+      stack.push(i0);
       while (stack.length) {
-        const [cx, cy, cz] = stack.pop()!;
-        for (const [dx, dy, dz] of nb) {
-          const nx = cx+dx
-          const ny = cy+dy
-          const nz = cz+dz;
-          if (solid(nx, ny, nz) && islandId[nx][ny][nz] === -1) {
-            islandId[nx][ny][nz] = id;
-            stack.push([nx, ny, nz]);
+        const cur = stack.pop()!;
+        const cz = cur % sizeZ;
+        const t1 = (cur - cz) / sizeZ;
+        const cy = t1 % sizeY;
+        const cx = (t1 - cy) / sizeY;
+        for (let n = 0; n < 6; n++) {
+          const nx = cx + nb[n][0], ny = cy + nb[n][1], nz = cz + nb[n][2];
+          if (nx < 0 || ny < 0 || nz < 0 || nx >= sizeX || ny >= sizeY || nz >= sizeZ) continue;
+          const ni = idx(nx, ny, nz);
+          if (values[ni] > surfaceLevel && islandId[ni] === -1) {
+            islandId[ni] = id;
+            stack.push(ni);
           }
         }
       }
     }
 
-const cubes = [];
-for (let x = 0; x < points.length - 1; x++) {
-  for (let y = 0; y < points[0].length - 1; y++) {
-    for (let z = 0; z < points[0][0].length - 1; z++) {
-
-      const cube = {
-        corners: [
-          points[x][y][z],
-          points[x + 1][y][z],
-          points[x + 1][y + 1][z],
-          points[x][y + 1][z],
-          points[x][y][z + 1],
-          points[x + 1][y][z + 1],
-          points[x + 1][y + 1][z + 1],
-          points[x][y + 1][z + 1],
-        ]
-      };
-
-      cubes.push(cube);
-    }
-  }
-}
-
 const allVerts: number[] = [];
 const allColors: number[] = [];
 
-for (let i = 0; i < cubes.length; i++) {
-  let cubeIndex = 0;
-  for (let j = 0; j < 8; j++)
-    if (cubes[i].corners[j].value > surfaceLevel) cubeIndex |= 1 << j;
+const candX: number[] = [];
+const candY: number[] = [];
+const candZ: number[] = [];
+const candBiome: number[] = [];
 
-  const triangulation = TriangulationTable[cubeIndex];
-  for (let t = 0; t < triangulation.length && triangulation[t] !== -1; t += 3) {
-    const P: THREE.Vector3[] = [];
-    const C: THREE.Color[] = [];
-    for (let k = 0; k < 3; k++) {
-      const [a, b] = cornerIndexFromEdge[triangulation[t + k]];
-      const c1 = cubes[i].corners[a], c2 = cubes[i].corners[b];
-      const pos = interpolateVertex(c1.position, c2.position, c1.value, c2.value, surfaceLevel);
-      const sc = c1.value > surfaceLevel ? c1 : c2;
-      const gx = Math.round(sc.position.x * resolution);
-      const gy = Math.round(sc.position.y * resolution);
-      const gz = Math.round(sc.position.z * resolution);
-      const id = islandId[gx][gy][gz];
-      P.push(pos);
-      C.push(gradient(pos.y, topStops(islandBiome(id))));
-    }
-    for (const o of [2, 1, 0]) {
-      allVerts.push(P[o].x, P[o].y, P[o].z);
-      allColors.push(C[o].r, C[o].g, C[o].b);
+const cval = new Float64Array(8);
+const cwx = new Float64Array(8);
+const cwy = new Float64Array(8);
+const cwz = new Float64Array(8);
+const cgi = new Int32Array(8);
+const triPos = new Float64Array(9);
+const triCol = new Float64Array(9);
+const tmpCol = new Float32Array(3);
+
+for (let x = 0; x < sizeX - 1; x++) {
+  for (let y = 0; y < sizeY - 1; y++) {
+    for (let z = 0; z < sizeZ - 1; z++) {
+      let cubeIndex = 0;
+      for (let j = 0; j < 8; j++) {
+        const o = cornerOffset[j];
+        const gi = idx(x + o[0], y + o[1], z + o[2]);
+        cgi[j] = gi;
+        const v = values[gi];
+        cval[j] = v;
+        if (v > surfaceLevel) cubeIndex |= 1 << j;
+      }
+      if (cubeIndex === 0 || cubeIndex === 255) continue;
+
+      let wantRock = false;
+      let cubeBiome = -1;
+      if (ROCKS_ENABLED) {
+        let solidJ = -1;
+        for (let j = 0; j < 8; j++) { if (cval[j] > surfaceLevel) { solidJ = j; break; } }
+        if (solidJ >= 0) {
+          cubeBiome = islandId[cgi[solidJ]] % biomes.length;
+          if (rockBiomes.has(cubeBiome)) {
+            let oy = 0;
+            for (let j = 0; j < 8; j++) {
+              const air = cval[j] > surfaceLevel ? -1 : 1;
+              const ySign = cornerOffset[j][1] === 1 ? 1 : -1;
+              oy += air * ySign;
+            }
+            if (oy > rockUpThreshold) wantRock = true;
+          }
+        }
+      }
+      let seedX = 0, seedY = 0, seedZ = 0, seedN = 0;
+
+      for (let j = 0; j < 8; j++) {
+        const o = cornerOffset[j];
+        cwx[j] = (x + o[0]) * inv;
+        cwy[j] = (y + o[1]) * inv;
+        cwz[j] = (z + o[2]) * inv;
+      }
+
+      const tri = TriangulationTable[cubeIndex];
+      for (let t = 0; t < tri.length && tri[t] !== -1; t += 3) {
+        for (let k = 0; k < 3; k++) {
+          const e = tri[t + k];
+          const a = cornerIndexFromEdge[e][0], b = cornerIndexFromEdge[e][1];
+          const va = cval[a], vb = cval[b];
+
+          const denom = vb - va;
+          const tt = Math.abs(denom) < 1e-6 ? 0.5 : (surfaceLevel - va) / denom;
+
+          const px = cwx[a] + (cwx[b] - cwx[a]) * tt;
+          const py = cwy[a] + (cwy[b] - cwy[a]) * tt;
+          const pz = cwz[a] + (cwz[b] - cwz[a]) * tt;
+
+          const solidCorner = va > surfaceLevel ? a : b;
+          const id = islandId[cgi[solidCorner]];
+          const stops = biomeStops[id % biomeStops.length];
+          gradientRGB(py, stops, tmpCol);
+
+          const k3 = k * 3;
+          triPos[k3] = px; triPos[k3 + 1] = py; triPos[k3 + 2] = pz;
+          triCol[k3] = tmpCol[0]; triCol[k3 + 1] = tmpCol[1]; triCol[k3 + 2] = tmpCol[2];
+
+          if (wantRock) { seedX += px; seedY += py; seedZ += pz; seedN++; }
+        }
+        for (const ord of [2, 1, 0]) {
+          const o3 = ord * 3;
+          allVerts.push(triPos[o3], triPos[o3 + 1], triPos[o3 + 2]);
+          allColors.push(triCol[o3], triCol[o3 + 1], triCol[o3 + 2]);
+        }
+      }
+
+      if (wantRock && seedN > 0) {
+        candX.push(seedX / seedN);
+        candY.push(seedY / seedN);
+        candZ.push(seedZ / seedN);
+        candBiome.push(cubeBiome);
+      }
     }
   }
 }
-
-const geometry = new THREE.BufferGeometry();
-geometry.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
-geometry.computeVertexNormals();
 
 scene.add(new THREE.HemisphereLight(0xddeeff, 0x4a5d23, 1.0));
 const sun = new THREE.DirectionalLight(0xffffff, 1.5);
 sun.position.set(10, 20, 10);
 scene.add(sun);
 
-const topGeo = new THREE.BufferGeometry();
-topGeo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
-topGeo.setAttribute('color',    new THREE.Float32BufferAttribute(allColors, 3));
+const botVerts = new Array<number>(allVerts.length);
+const botColors = new Array<number>(allColors.length);
+const seamStone = new Float32Array(3);
+for (let i = 0; i < allVerts.length; i += 9) {
+  for (let vi = 0; vi < 3; vi++) {
+    const src = i + (2 - vi) * 3;
+    const dst = i + vi * 3;
+    const bx = allVerts[src];
+    const by = -stretch * allVerts[src + 1];
+    const bz = allVerts[src + 2];
+    botVerts[dst] = bx; botVerts[dst + 1] = by; botVerts[dst + 2] = bz;
 
-const bottomGeo = topGeo.clone();
-bottomGeo.scale(1, -stretch, 1);
-const pos = bottomGeo.getAttribute('position').array as Float32Array;
-
-for (let i = 0; i < pos.length; i += 9) {
-  for (let k = 0; k < 3; k++) {
-    const tmp = pos[i + k]; pos[i + k] = pos[i + 6 + k]; pos[i + 6 + k] = tmp;
+    stoneColorRGB(by, seamStone);
+    const blend = seamBlend(bx, by, bz);
+    const biR = allColors[src], biG = allColors[src + 1], biB = allColors[src + 2];
+    botColors[dst]     = seamStone[0] + (biR - seamStone[0]) * blend;
+    botColors[dst + 1] = seamStone[1] + (biG - seamStone[1]) * blend;
+    botColors[dst + 2] = seamStone[2] + (biB - seamStone[2]) * blend;
   }
 }
 
-const bcol = bottomGeo.getAttribute('color').array as Float32Array;
-for (let i = 0; i < pos.length; i += 3) {
-  const c = stoneColor(pos[i + 1]);
-  bcol[i] = c.r; bcol[i + 1] = c.g; bcol[i + 2] = c.b;
+for (let i = 0; i < allVerts.length; i += 3) {
+  const x = allVerts[i], y = allVerts[i + 1], z = allVerts[i + 2];
+  stoneColorRGB(y, seamStone);
+  const blend = seamBlend(x, y, z);
+  allColors[i] = seamStone[0] + (allColors[i] - seamStone[0]) * blend;
+  allColors[i + 1] = seamStone[1] + (allColors[i + 1] - seamStone[1]) * blend;
+  allColors[i + 2] = seamStone[2] + (allColors[i + 2] - seamStone[2]) * blend;
 }
+
+const dbuf = new Float64Array(3);
+for (let i = 0; i < allVerts.length; i += 3) {
+  seamDeform(allVerts[i], allVerts[i + 1], allVerts[i + 2], dbuf);
+  allVerts[i] = dbuf[0]; allVerts[i + 1] = dbuf[1]; allVerts[i + 2] = dbuf[2];
+}
+for (let i = 0; i < botVerts.length; i += 3) {
+  seamDeform(botVerts[i], botVerts[i + 1], botVerts[i + 2], dbuf);
+  botVerts[i] = dbuf[0]; botVerts[i + 1] = dbuf[1]; botVerts[i + 2] = dbuf[2];
+}
+
+const topGeo = new THREE.BufferGeometry();
+topGeo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
+topGeo.setAttribute('color', new THREE.Float32BufferAttribute(allColors, 3));
+
+const bottomGeo = new THREE.BufferGeometry();
+bottomGeo.setAttribute('position', new THREE.Float32BufferAttribute(botVerts, 3));
+bottomGeo.setAttribute('color', new THREE.Float32BufferAttribute(botColors, 3));
 
 let merged = BufferGeometryUtils.mergeGeometries([topGeo, bottomGeo]);
 merged = BufferGeometryUtils.mergeVertices(merged);
-merged.computeVertexNormals();
 
 const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true });
 scene.add(new THREE.Mesh(merged, mat));
+
+if (ROCKS_ENABLED && candX.length > 0) {
+  const rng = mulberry32(1337);
+  const C = candX.length;
+  const order = new Int32Array(C);
+  for (let i = 0; i < C; i++) order[i] = i;
+  for (let i = C - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+  }
+
+  const nRocks = Math.min(maxRocks, C);
+  for (let r = 0; r < nRocks; r++) {
+    const ci = order[r];
+    const radius = rockMinRadius + (rockMaxRadius - rockMinRadius) * rng();
+    marchRock(
+      candX[ci], candY[ci] - radius * rockBury, candZ[ci], radius,
+      rng() * 1000, rng() * 1000, rng() * 1000, candBiome[ci],
+    );
+  }
+
+  if (rockVerts.length > 0) {
+    const rockGeo = new THREE.BufferGeometry();
+    rockGeo.setAttribute('position', new THREE.Float32BufferAttribute(rockVerts, 3));
+    rockGeo.setAttribute('color', new THREE.Float32BufferAttribute(rockColors, 3));
+    scene.add(new THREE.Mesh(rockGeo, mat));
+  }
+}
 
 
 function animate() {
